@@ -19,6 +19,7 @@ class State:
     next_id: Optional[int] = None
     keyword: str = "Completed"          # Default keyword
     lock = asyncio.Lock()               # Prevent concurrent forwards
+    custom_replies: dict = {}           # NEW: trigger → response
 
 app = Client(APP_NAME, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -31,14 +32,18 @@ HELP = f"""
 /settarget `<chat_id|@username>` – Set target group/channel
 /setrange `<first_id> <last_id>` – Set message ID range (inclusive)
 /setkeyword `<text>` – Set trigger keyword (default: `Completed`)
+/setreply `<trigger> <response>` – Add a custom auto-reply
+/replies – Show all custom replies
+/delreply `<trigger>` – Delete a custom reply
 /status – Show current settings & progress
 /reset – Clear all settings
 
 **How it works**
-When the bot sees the keyword in the **target chat**, it forwards the **next message** from the configured range in the **source** to the **target**, one by one, until it reaches the last ID.
+• When the bot sees the keyword in the **target chat**, it forwards the **next message** from the configured range in the **source** to the **target**, one by one.  
+• Custom replies: if the bot sees a message containing a trigger word, it auto-replies with the saved response.
 
 **Notes**
-• Add the bot to both chats.
+• Add the bot to both chats.  
 • Bot must be able to **read** the source channel and **send** in the target chat.
 """
 
@@ -58,10 +63,9 @@ async def can_read_source(client: Client, chat_id: int) -> Tuple[bool, str]:
         if chat.type not in (ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP):
             return False, "Source must be a channel or group"
         try:
-            member = await client.get_chat_member(chat.id, "me")
+            await client.get_chat_member(chat.id, "me")
         except UserNotParticipant:
             return False, "Bot is not a member of the source"
-        # reading messages in channels requires membership (no specific admin right)
         return True, "OK"
     except (PeerIdInvalid, ChannelInvalid):
         return False, "Invalid source chat"
@@ -79,7 +83,6 @@ async def can_send_target(client: Client, chat_id: int) -> Tuple[bool, str]:
             return False, "Bot is not a member of the target"
         if member.status == ChatMemberStatus.ADMINISTRATOR:
             return True, "OK"
-        # Non-admin might be fine in groups; in channels, bot must be admin to post.
         if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             return True, "OK"
         return False, "Bot must be admin in target channel to post"
@@ -160,6 +163,37 @@ async def cmd_set_keyword(_c: Client, m: Message):
     State.keyword = " ".join(m.command[1:]).strip()
     await m.reply_text(f"✅ Keyword set to: `{State.keyword}`", parse_mode=ParseMode.MARKDOWN)
 
+# --- NEW: setreply, replies, delreply ---
+@app.on_message(filters.command("setreply"))
+async def cmd_set_reply(_c: Client, m: Message):
+    if len(m.command) < 3:
+        return await m.reply_text("Usage: /setreply <trigger> <response>")
+    trigger = m.command[1].lower()
+    response = " ".join(m.command[2:])
+    State.custom_replies[trigger] = response
+    await m.reply_text(f"✅ Reply set: when someone says `{trigger}`, bot replies `{response}`",
+                       parse_mode=ParseMode.MARKDOWN)
+
+@app.on_message(filters.command("replies"))
+async def cmd_list_replies(_c: Client, m: Message):
+    if not State.custom_replies:
+        return await m.reply_text("ℹ️ No custom replies set.")
+    text = "🔹 **Custom Replies:**\n"
+    for k, v in State.custom_replies.items():
+        text += f"▫️ `{k}` → `{v}`\n"
+    await m.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+@app.on_message(filters.command("delreply"))
+async def cmd_del_reply(_c: Client, m: Message):
+    if len(m.command) < 2:
+        return await m.reply_text("Usage: /delreply <trigger>")
+    trigger = m.command[1].lower()
+    if trigger in State.custom_replies:
+        del State.custom_replies[trigger]
+        await m.reply_text(f"✅ Deleted reply for `{trigger}`", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await m.reply_text(f"❌ No reply found for `{trigger}`")
+
 @app.on_message(filters.command("status"))
 async def cmd_status(c: Client, m: Message):
     async def name_or_id(chat_id: Optional[int]) -> str:
@@ -178,6 +212,7 @@ async def cmd_status(c: Client, m: Message):
 • Target: {tgt}
 • Range: {range_str()}
 • Keyword: `{State.keyword}`
+• Custom replies: {len(State.custom_replies)}
 """
     await m.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -189,64 +224,60 @@ async def cmd_reset(_c: Client, m: Message):
     State.end_id = None
     State.next_id = None
     State.keyword = "Completed"
-    await m.reply_text("✅ Settings reset. Keyword reverted to `Completed`", parse_mode=ParseMode.MARKDOWN)
+    State.custom_replies = {}
+    await m.reply_text("✅ Settings reset. Keyword reverted to `Completed`. All custom replies cleared.")
 
 # ====================== FORWARD LOGIC ======================
 async def forward_next_if_ready(c: Client, trigger_msg: Message):
-    # Ensure trigger comes from the configured target chat
     if State.target_chat_id is None or trigger_msg.chat.id != State.target_chat_id:
-        return  # ignore triggers from other chats
-
+        return
     ok, why = ready_to_forward()
     if not ok:
-        # Be quiet unless the user explicitly asks? We'll notify to help set up.
         await trigger_msg.reply_text(f"⚠️ Not ready to forward: {why}")
         return
-
     async with State.lock:
-        # Double-check range and progress
         if State.next_id is None or State.start_id is None or State.end_id is None:
             return
-
         if State.next_id > State.end_id:
             await trigger_msg.reply_text("✅ All messages in the range have already been forwarded.")
             return
-
         try:
-            # Try to copy the message (preserves media, caption, markup)
             msg = await c.get_messages(State.source_chat_id, State.next_id)
             if not msg or msg.empty:
                 await trigger_msg.reply_text(f"⚠️ Skipping missing message ID {State.next_id}")
                 State.next_id += 1
                 return
-
             await c.copy_message(
                 chat_id=State.target_chat_id,
                 from_chat_id=State.source_chat_id,
                 message_id=State.next_id
             )
-
             await trigger_msg.reply_text(f"➡️ Forwarded message `{State.next_id}`", parse_mode=ParseMode.MARKDOWN)
             State.next_id += 1
-
         except FloodWait as e:
             await trigger_msg.reply_text(f"⏳ FloodWait: sleeping {e.value}s")
             await asyncio.sleep(e.value)
         except RPCError as e:
             await trigger_msg.reply_text(f"❌ Forward error on ID {State.next_id}: {e}")
-            State.next_id += 1  # advance to avoid being stuck
+            State.next_id += 1
         except Exception as e:
             await trigger_msg.reply_text(f"❌ Unexpected error on ID {State.next_id}: {e}")
             State.next_id += 1
 
-# Listen for the keyword in the TARGET chat
+# ====================== TEXT HANDLER ======================
 @app.on_message(filters.text)
 async def on_text(c: Client, m: Message):
-    # If no keyword set or not text, ignore
-    if not State.keyword or not m.text:
+    if not m.text:
         return
-    # Check case-insensitive containment (e.g., "Completed ✅" also works)
-    if State.keyword.lower() in m.text.lower():
+    text_lower = m.text.lower()
+
+    # 1) Custom replies
+    for trigger, response in State.custom_replies.items():
+        if trigger in text_lower:
+            await m.reply_text(response)
+
+    # 2) Forward keyword
+    if State.keyword and State.keyword.lower() in text_lower:
         await forward_next_if_ready(c, m)
 
 # ====================== MAIN ======================
